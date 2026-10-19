@@ -1,13 +1,23 @@
 import {
-  Controller, Get, Post, Body, Param, Query, Req, UseGuards,
+  Controller, Get, Post, Put, Body, Param, Query, Req, UseGuards,
   HttpCode, HttpStatus, ParseIntPipe,
 } from '@nestjs/common';
 import { ProjectsService } from './projects.service';
 import { CreateProjectDto } from './dto/create-project.dto';
+import { UpdateProjectCertificationsDto } from './dto/update-certifications.dto';
 import { PaginationDto } from '../common/dto/pagination.dto';
-import { ProjectResponse, ProjectProvenanceResponse } from './interfaces/project.interface';
+import {
+  ProjectResponse,
+  ProjectProvenanceResponse,
+  CertificationVersion,
+  CouponCertification,
+  UpdateCertificationsResponse,
+} from './interfaces/project.interface';
+
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
-import { AdminGuard } from '../common/guards/admin.guard';
+import { PermissionsGuard } from '../common/guards/permissions.guard';
+import { RequirePermissions } from '../common/decorators/permissions.decorator';
+import { Permission } from '../auth/rbac';
 import { IntentGuard } from '../common/guards/intent.guard';
 import { RequireIntent } from '../common/decorators/require-intent.decorator';
 import { AuthenticatedRequest } from '../common/interfaces/authenticated-request.interface';
@@ -25,7 +35,7 @@ export class ProjectsController {
 
   @Get()
   async findAll(@Query() query: PaginationDto) {
-    return this.projectsService.findAll(query.page, query.limit);
+    return this.projectsService.findAll(query.page, query.limit, query.cursor);
   }
 
   @Get(':id')
@@ -43,7 +53,8 @@ export class ProjectsController {
   }
 
   @Post(':id/approve')
-  @UseGuards(JwtAuthGuard, AdminGuard, IntentGuard)
+  @UseGuards(JwtAuthGuard, PermissionsGuard, IntentGuard)
+  @RequirePermissions(Permission.APPROVE_PROJECT)
   @RequireIntent('approve_project')
   @HttpCode(HttpStatus.OK)
   async approve(
@@ -53,7 +64,8 @@ export class ProjectsController {
   }
 
   @Post(':id/reject')
-  @UseGuards(JwtAuthGuard, AdminGuard, IntentGuard)
+  @UseGuards(JwtAuthGuard, PermissionsGuard, IntentGuard)
+  @RequirePermissions(Permission.REJECT_PROJECT)
   @RequireIntent('reject_project')
   @HttpCode(HttpStatus.OK)
   async reject(
@@ -79,5 +91,46 @@ export class ProjectsController {
   ): Promise<any> {
     const auditorAddress = req.user?.walletAddress || '';
     return this.projectsService.exportProject(id, auditorAddress);
+  }
+
+  @Post(':id/certifications')
+  @HttpCode(HttpStatus.CREATED)
+  async addCertification(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() body: { cid: string; kind?: 'performance-report' | 'third-party-certification' | 'document' },
+  ): Promise<CertificationVersion> {
+    return this.projectsService.addCertification(id, body.cid, body.kind ?? 'document');
+  }
+
+  /**
+   * Idempotent project certification document updates (#459).
+   */
+  @Put(':id/certifications')
+  @HttpCode(HttpStatus.OK)
+  async updateCertifications(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: UpdateProjectCertificationsDto,
+    @Req() req: any,
+  ): Promise<UpdateCertificationsResponse> {
+    const callerAddress =
+      req.user?.walletAddress || req.headers['x-wallet-address'] || '';
+    return this.projectsService.updateProjectCertifications(id, dto, callerAddress);
+  }
+
+
+  @Get(':id/certifications')
+  async certificationHistory(
+    @Param('id', ParseIntPipe) id: number,
+  ): Promise<CertificationVersion[]> {
+    return this.projectsService.getCertificationHistory(id);
+  }
+
+  @Get(':id/coupon-certification')
+  async couponCertification(
+    @Param('id', ParseIntPipe) id: number,
+    @Query('bondId', ParseIntPipe) bondId: number,
+    @Query('periodIndex', ParseIntPipe) periodIndex: number,
+  ): Promise<CouponCertification> {
+    return this.projectsService.getCouponCertification(id, bondId, periodIndex);
   }
 }

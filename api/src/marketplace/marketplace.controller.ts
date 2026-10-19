@@ -1,9 +1,10 @@
 import {
-  Controller, Get, Post, Delete, Body, Param, Query, Req,
-  HttpCode, HttpStatus, ParseIntPipe, UseGuards, NotFoundException,
+  Controller, Get, Post, Put, Delete, Body, Param, Query, Req,
+  HttpCode, HttpStatus, ParseIntPipe, UseGuards, NotFoundException, BadRequestException,
 } from '@nestjs/common';
 import { DexService } from './dex.service';
 import { LiquidityService } from './liquidity.service';
+import { PriceImpactService } from './price-impact.service';
 import { StellarService } from '../stellar/stellar.service';
 import { DexReconciliationService, ReconciliationReport } from './dex.reconciliation.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -12,11 +13,15 @@ import { BuyBondDto } from './dto/buy-bond.dto';
 import { DepositQuoteDto } from './dto/deposit-quote.dto';
 import { WithdrawQuoteDto } from './dto/withdraw-quote.dto';
 import { QuoteBalanceQueryDto } from './dto/quote-balance-query.dto';
+import { UpdatePriceImpactConfigDto } from './dto/price-impact-config.dto';
 import { RateLimit } from '../common/decorators/rate-limit.decorator';
 import {
   OrderResponse,
   PriceFeedResponse,
+  PriceImpactConfig,
+  PriceImpactEvaluation,
   PriceLevel,
+  QuoteAsset,
   QuoteBalanceResponse,
   QuoteTransactionResponse,
   SlippageResponse,
@@ -31,6 +36,7 @@ export class MarketplaceController {
   constructor(
     private readonly dexService: DexService,
     private readonly liquidityService: LiquidityService,
+    private readonly priceImpactService: PriceImpactService,
     private readonly stellarService: StellarService,
     private readonly reconciliation: DexReconciliationService,
   ) {}
@@ -55,6 +61,7 @@ export class MarketplaceController {
       status,
       pagination.page ?? 1,
       pagination.limit ?? 20,
+      pagination.cursor,
     );
   }
 
@@ -125,6 +132,7 @@ export class MarketplaceController {
   }
 
   @Delete('orders/:id')
+  @Idempotent()
   @RateLimit({ type: 'mutation' })
   @HttpCode(HttpStatus.NO_CONTENT)
   async cancelOrder(
@@ -145,24 +153,73 @@ export class MarketplaceController {
   @Get('prices')
   async getPriceFeed(
     @Query('bondId') bondId?: number,
+    @Query('quoteAsset') quoteAsset?: QuoteAsset,
   ): Promise<PriceFeedResponse[]> {
-    return this.liquidityService.getPriceFeed(bondId ? Number(bondId) : undefined);
+    return this.liquidityService.getPriceFeed(
+      bondId ? Number(bondId) : undefined,
+      quoteAsset,
+    );
   }
 
   @Get('prices/:bondId/best')
   async getBestPrice(
     @Param('bondId', ParseIntPipe) bondId: number,
     @Query('side') side: 'buy' | 'sell' = 'sell',
+    @Query('quoteAsset') quoteAsset?: QuoteAsset,
   ): Promise<PriceLevel> {
-    return this.liquidityService.getBestPrice(bondId, side);
+    return this.liquidityService.getBestPrice(bondId, side, quoteAsset);
   }
 
   @Get('prices/:bondId/slippage')
   async calculateSlippage(
     @Param('bondId', ParseIntPipe) bondId: number,
-    @Query('amount') amount: number,
+    @Query('amount') amount: string,
+    @Query('quoteAsset') quoteAsset: QuoteAsset = 'USDC',
   ): Promise<SlippageResponse> {
-    return this.liquidityService.calculateSlippage(bondId, Number(amount));
+    return this.liquidityService.calculateSlippage(bondId, amount, quoteAsset);
+  }
+
+  @Get('prices/:bondId/impact')
+  async evaluatePriceImpact(
+    @Param('bondId', ParseIntPipe) bondId: number,
+    @Query('amount') amount: string,
+    @Query('quoteAsset') quoteAsset: QuoteAsset = 'USDC',
+  ): Promise<PriceImpactEvaluation> {
+    return this.priceImpactService.evaluatePriceImpact(bondId, amount, quoteAsset);
+  }
+
+  @Get('config/:bondId/impact-limits')
+  async getPriceImpactConfig(
+    @Param('bondId', ParseIntPipe) bondId: number,
+  ): Promise<PriceImpactConfig> {
+    return this.priceImpactService.getConfig(bondId);
+  }
+
+  @Put('config/:bondId/impact-limits')
+  @RateLimit({ type: 'mutation' })
+  @HttpCode(HttpStatus.OK)
+  async updatePriceImpactConfig(
+    @Param('bondId', ParseIntPipe) bondId: number,
+    @Body() dto: UpdatePriceImpactConfigDto,
+    @Req() req: any,
+  ): Promise<PriceImpactConfig> {
+    const operator = req.headers['x-wallet-address'] as string;
+    if (!operator) {
+      throw new BadRequestException('Missing x-wallet-address header for operator authorization');
+    }
+    const patch: Partial<PriceImpactConfig> = {};
+    if (dto.illiquidThresholdAmount !== undefined) patch.illiquidThresholdAmount = dto.illiquidThresholdAmount;
+    if (dto.moderateThresholdAmount !== undefined) patch.moderateThresholdAmount = dto.moderateThresholdAmount;
+    if (dto.maxIlliquidDepthConsumptionBps !== undefined) patch.maxIlliquidDepthConsumptionBps = dto.maxIlliquidDepthConsumptionBps;
+    if (dto.maxLiquidImpactBps !== undefined || dto.maxModerateImpactBps !== undefined || dto.maxIlliquidImpactBps !== undefined) {
+      const current = await this.priceImpactService.getConfig(bondId);
+      patch.tierImpactLimitsBps = {
+        LIQUID: dto.maxLiquidImpactBps ?? current.tierImpactLimitsBps.LIQUID,
+        MODERATE: dto.maxModerateImpactBps ?? current.tierImpactLimitsBps.MODERATE,
+        ILLIQUID: dto.maxIlliquidImpactBps ?? current.tierImpactLimitsBps.ILLIQUID,
+      };
+    }
+    return this.priceImpactService.setConfig(bondId, patch);
   }
 
   /**
